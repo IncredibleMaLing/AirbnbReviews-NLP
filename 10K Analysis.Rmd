@@ -1,0 +1,1102 @@
+---
+title: "10K Analysis"
+author: "Ling Ma"
+date: "21/06/2021"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(udpipe)
+library(dplyr)
+library(ggplot2)
+library(pdftools)
+library(qdap)
+library(textshape)
+library(stringr)
+library(edgar)
+library(lubridate)
+library(SentimentAnalysis)
+library(tabulizer)
+library(rvest)
+library(readr)
+library(tm)
+library(glue)
+library(tidytext)
+library(httr)
+library(textclean)
+library(lexicon)
+library(chron)
+library(BatchGetSymbols)
+library(data.table)
+library(textmineR)
+library(quanteda)
+```
+
+\newpage
+
+```{r knitroptions, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+# Part A: Construction of Corpus -- Fetching 10-K forms from EDGAR
+
+## Extract required company list 
+
+```{r get_cik_list}
+# All information related to the companies listed in S&P 500
+# are listed from the pdf file.
+# However, I don't have the permission to share the .pdf file
+# Therefore, the cik_table are available in .csv 
+
+
+# Extracting tables from PDF file
+pdf_list <- extract_tables("../individual_assignment_description_ib9cw0_2021.pdf", page = c(5, 6, 7))
+
+# Check the information for each page to ensure the converted data structured properly.
+head(pdf_list[[1]])
+head(pdf_list[[2]])
+head(pdf_list[[3]])
+
+# Some structural issues are found in the first page where CIK column is misplaced. Let's save it into a dataframe and then fix the problem.
+
+pg1 <- as.data.frame(pdf_list[[1]])
+pg2 <- as.data.frame(pdf_list[[2]])
+pg3 <- as.data.frame(pdf_list[[3]])
+pg1$V5[2:27] <- pg1$V6[2:27]
+pg1$V6 <- NULL
+colnames(pg1) <- pg1[1,]
+pg1 <- pg1[-1, ]
+colnames(pg2) <- colnames(pg1)
+colnames(pg3) <- colnames(pg1)
+# Combine three dataframes into one.
+company_list <- pg1 %>% 
+  bind_rows(pg2) %>% 
+  bind_rows(pg3)
+
+
+# Format column types
+company_list <- company_list %>%
+  mutate_if(is.character,as.factor) 
+
+company_list$Symbol <-  as.character(company_list$Symbol)
+company_list$CIK <-  as.character(company_list$CIK)
+company_list$Security <-  as.character(company_list$Security)
+
+company_list <- rename(company_list, GICS_Sector = 'GICS Sector', GICS_Sub_Industry = 'GICS Sub Industry')
+# # Check and remove the duplicated CIK as it belong to the same company 
+# # (cross-checked from Master Indexes)
+# company_list %>% group_by(CIK) %>% summarise(total=n()) %>% arrange(desc(total))
+# 
+# # Delete duplicates by CIK code
+# cik_table <- cik_table[!duplicated(cik_table$CIK), ]
+
+# Save data frame in .csv file
+write.csv(company_list, file="company_list.csv",row.names=F,col.names=T)
+```
+
+## Inspect the master index
+
+```{r get_index, eval=FALSE}
+
+#  Download the master indexes with all the links to crawl and fetch the reports submitted in year 2010-2020
+edgar::getMasterIndex(filing.year = c(2010:2020))
+
+# Load all information of S&P 500 from Master Index .Rda files into a data frame.The package will create a folder called "Master Indexes" and will aggregate **all the report metadata filed** for the that is specified. 
+master_indexes <- list.files("Master Indexes/",pattern="Rda")
+all_indexes <- data.frame()
+
+# We just want those master indexes info which are among our company list and only their 10-k files.
+for (master_index in master_indexes){
+  load(paste0("Master Indexes/",master_index))
+  this_index <- year.master %>%
+    filter(cik %in% c(company_list$cik), form.type %in% c("10-K"))
+  all_indexes <- rbind(all_indexes, this_index)
+}
+
+# Normalise the name of the columns into snake format.
+colnames(all_indexes) <- c("cik", "company_name","form_type", "date_filed", "edgar_link", "quarter")
+
+# Format column type
+all_indexes$cik <- all_indexes$cik %>% as.integer()
+all_indexes$form_type <- as.factor(all_indexes$form_type)
+all_indexes$date_filed <- ymd(all_indexes$date_filed)
+# Let's extract the year when the reports were filed for further analysis
+all_indexes <- all_indexes %>%
+  mutate(year = year(all_indexes$date_filed))
+
+all_indexes$year <- as.integer(all_indexes$year)
+
+# Find the date before and after reports are filed within period of two weeks for further analysis.
+all_indexes$date_before <- all_indexes$date_filed - 7
+all_indexes$date_after <- all_indexes$date_filed + 3
+
+# Check if there any duplicated form grouped by CIK and Filing Year
+all_indexes %>% group_by(cik, year) %>% summarise(total = n()) %>% arrange(desc(total))
+```
+
+## Extract parts of the 10-k forms (management's reflection part)
+
+-   Using the CIK code of any company, the report type (in our case set to `10-K` and the year of filing we can download the report in html form
+
+```{r management_reflection_extraction, eval=FALSE}
+# Download and scrape textual information from edgar getMgmtDisc (Section 7: Management Discussion)
+# Use master_index_10K data frame from Rscript 2
+
+md_df <- data.frame()
+error_file <- vector()
+for(i in 1:length(all_indexes$cik)){
+  tryCatch({
+    cik <- all_indexes$cik[i]
+    filing_year <- all_indexes$year[i]
+    
+    # Download 10K Management Discussion and list files from file location
+    edgar::getMgmtDisc(cik.no = cik, filing.year = filing_year)
+    list_file <- list.files("MD&A section text/", full.names = T)
+    
+    # Cleaning textual contents for each form
+    # Removing digits, punctuations, white spaces and lower case
+    for(j in 1:length(list_file)){
+      this_file <- list_file[j]
+      this_md_text <- read_file(this_file) %>%
+        tolower() %>%
+        removePunctuation() %>%
+        removeNumbers() %>%
+        stripWhitespace()
+
+      # Store cleaned textual contents to a data frame
+      this_md_df <- data.frame(matrix(ncol = 3, nrow = 0))
+      this_md_df <- as.data.frame(cbind(cik, this_md_text, filing_year))
+      colnames(this_md_df) <- c("cik", "text", "year")
+
+      md_df <- rbind(md_df, this_md_df)
+
+    }
+
+    md_df$cik <- as.integer(md_df$cik)
+    md_df <- md_df %>% inner_join(company_list)
+    
+  }
+  , error = function(ec){
+    error_file <- append(error_file, paste0(cik, "-", filing_year))
+  }
+  # Delete folder path and files inside
+  , finally = {
+    unlink(paste0(getwd(), "/MD&A section text"), recursive = T)
+    unlink(paste0(getwd(),"/Edgar filings_full text"), recursive = T)
+    print(i)
+  }
+  
+  )
+}
+write.csv(md_df, file="management_discussion_text.csv",row.names=F,col.names=T)
+```
+
+## Custom stopwords 
+
+```{r fet10q, eval=FALSE}
+# Create custom stop words 
+# and remove from SEC 10-K forms' textual data
+data("stop_words") # Multilangual stopwords list
+data("sw_fry_1000") # Fry's 1000 Most Commonly Used English Words
+
+# Create a function to automatically remove digit,
+# remove punctuations and transform all letters to lower
+stopword_funct <- function(x){
+  x <- gsub('[[:digit:]]+',' ', x)
+  x <- gsub('[[:punct:]]+',' ', x)
+  x <- tolower(x)
+  return(x)
+} 
+
+company_list_copy <- company_list
+
+# Security/ company name should be added into stopwords
+company_list_copy$Security <-  stopword_funct(company_list_copy$Security)
+security <- company_list_copy %>%
+  select(Security) %>%
+  unnest_tokens(word, Security) %>%
+  select(word) %>%
+  unique(.)
+security_stopwords <- security$word
+
+# GICS Sector/ industry should be considered as stopwords
+company_list_copy$GICS_Sector <- stopword_funct(company_list_copy$GICS_Sector)
+industry <- company_list_copy %>% select(GICS_Sector) %>%
+  unnest_tokens(word, GICS_Sector) %>%
+  select(word) %>%
+  unique(.)
+industry_stopwords <- industry$word
+
+# GICS Sub Industry stopwords
+company_list_copy$GICS_Sub_Industry <-    stopword_funct(company_list_copy$GICS_Sub_Industry)
+subindustry <- company_list_copy %>% select(GICS_Sub_Industry) %>%
+  unnest_tokens(word, GICS_Sub_Industry) %>%
+  select(word) %>%
+  unique(.)
+subindustry_stopwords <- subindustry$word
+
+custom_stopwords <- tibble(word = unique(c(security_stopwords, industry_stopwords, subindustry_stopwords)), lexicon = "custom")
+
+# Create custom stop words list
+custom_stopwords <- rbind(stop_words, custom_stopwords)
+write.csv(custom_stopwords, file="custom_stopwords.csv",row.names=F,col.names=T)
+```
+
+## Tokenisation
+
+```{r tokenisation, eval=FALSE}
+text_df <-  md_df
+# Cleaning the textual files (remove non-latin words, digits, puctuations)
+text_df$text <- iconv(text_df$text, "latin1", "ASCII", "")
+text_df$text <- gsub('[[:digit:]]+',' ', text_df$text)
+text_df$text <- gsub('[[:punct:]]+',' ', text_df$text)
+# text_df$cik <- as.factor(text_df$CIK)
+text_df <- text_df %>% 
+  group_by(year) %>%
+  group_split()
+
+# Tokenize using parallelism, change to lower case andremove stop words from dictionary.
+tokens_all_10K <- data.frame()
+for(i in 1:11){
+  tokens_h <- text_df[[i]] %>%
+    unnest_tokens(word, text) 
+    tokens_h$word <- tolower(tokens_h$word)
+    tokens_h <- tokens_h %>%
+      add_count(word, cik) %>%
+      anti_join(custom_stopwords) %>%
+      filter(!(word %in% sw_fry_1000))
+    tokens_all_10K <- bind_rows(tokens_all_10K, tokens_h)
+    print(i)
+}
+
+tokens_all_10K$token_length <- nchar(tokens_all_10K$word)
+
+# Remove too short and too long tokens
+tokens_all_10K <- tokens_all_10K %>%
+  filter(between(token_length, 3, 15))
+
+# Spelling check
+# Remove words with spelling error
+library(hunspell)
+tokens_all_10K$spelling <- hunspell_check(tokens_all_10K$word)
+
+tokens_all_10K <- tokens_all_10K %>%
+  filter(spelling == TRUE)
+
+write.csv(tokens_all_10K, file="tokens_all_10K.csv",row.names=F,col.names=T)
+```
+
+## Part of Speech Tagging (POS)
+
+```{r }
+langmodel <- udpipe::udpipe_download_model("english")
+
+langmodel <- udpipe::udpipe_load_model(langmodel$file_model)
+
+
+udpipe_corpus <- tokens_all_10K %>%
+  select(cik, word, year, n) %>% 
+   group_by(cik, year) %>% 
+   group_split() 
+
+# # split text based on available cores
+# corpus_splitted <- split(tokens_all_10K, seq(1, nrow(tokens_all_10K), by = 1000))
+
+# returns a data.table
+annotate_splits <- function(x) {
+   start.time <- Sys.time()
+   txt <- sapply(x$word, FUN=function(y) paste(y, collapse = "\n"))
+   z <- as.data.frame(udpipe_annotate(langmodel, 
+                                   x = txt,
+                                   doc_id = x$cik,
+                                   tokenizer = "vertical"))
+   z <- z %>% mutate(
+     year = x$year,
+     n = x$n
+   )
+   
+   end.time <- Sys.time()
+   time.taken <- end.time - start.time
+   print(time.taken)
+   return(z)
+}
+
+annotation <- lapply(udpipe_corpus, annotate_splits)
+annotation <- rbindlist(annotation)
+
+annotated_tokens_all <- annotation %>% 
+  select(doc_id, year, n, lemma, upos) %>% 
+  rename(cik = doc_id, word = lemma) 
+
+## UPDATE lemmtisation with n
+
+write.csv(annotated_tokens_all, file="annotated_tokens_all.csv",row.names=F,col.names=T)
+```
+
+
+## TF-IDF 
+```{r}
+# While analysing TF-IDF, the most informative words would be adjective, adverb and noun.
+tokens_tf_idf <- annotated_tokens_all %>% select(cik, year, word, upos) %>%
+  filter(upos %in% c("ADJ","ADV","NOUN")) %>%
+  select(cik, word, year)
+
+# Company level - removing common words
+company_level <- annotated_tokens_all %>%
+  unique() %>% 
+  group_by(cik, word) %>% 
+  summarise(n_cik = n()) %>% 
+  bind_tf_idf(word, cik, n_cik)
+
+# IDF == 0 means this word appears in each document, needs to be removed. Filter TF-IDF = 0 and tore into common words list
+common_words <- company_level %>% 
+  filter(tf_idf == 0)
+
+common_words <- common_words %>%
+  ungroup() %>%
+  select(-cik) %>% 
+  unique()
+
+common <- common_words$word
+common_words <- tibble(word = common, lexicon = "custom")
+
+# Remove common words from tokens
+tokens_tf_idf <- tokens_tf_idf %>%
+  anti_join(common_words)
+annotated_tokens_all <- annotated_tokens_all %>%
+  anti_join(common_words)
+
+# Update custom stop words
+custom_stopwords_updated <- rbind(custom_stopwords, common_words) %>% unique()
+
+
+## 1. Industry Level (GICS Sector)
+
+tokens_all_10K$cik <- as.integer(tokens_all_10K$cik)
+# company_list <- rename(company_list, cik = CIK)
+company_list$cik <- as.integer(company_list$cik)
+industry_level <- tokens_tf_idf %>%
+  inner_join(company_list, by = "cik")
+
+# Calculate TF-IDF for industry aggregation category
+industry_level <- industry_level %>%
+  group_by(GICS_Sub_Industry, word) %>%
+  summarise(n_gics = n()) %>% 
+  bind_tf_idf(word, GICS_Sub_Industry, n_gics)
+
+# Plot TF-IDF distribution in histogram
+ggplot(industry_level, aes(x = tf_idf)) +
+  geom_histogram(bins = 50L, fill = "#0c4c8a") +
+  theme_minimal() + ggtitle("TF-IDF Plot - Industry Level (1)")
+
+# Use boxplot to detect outliers.
+ggplot(industry_level, aes(x = "", y = tf_idf)) +
+  geom_boxplot(fill = "#0c4c8a") +
+  theme_minimal()
+
+# According to Zif's law, we only keep the middle part which gives the most information. Here we use 3-sd rule as cut-off value to remove outliers.
+avg_industry_tf_idf <- mean(industry_level$tf_idf)
+sd_industry_tf_idf <- sd(industry_level$tf_idf)
+
+# Filter important words using left and right trim
+industry_level1 <- industry_level %>% 
+  filter(between(tf_idf,max(0, avg_industry_tf_idf - 3*sd_industry_tf_idf),
+                 avg_industry_tf_idf + 3*sd_industry_tf_idf))%>%
+  arrange(desc(tf_idf))
+
+# Re-plot trimmed TF-IDF boxplot 
+ggplot(industry_level1, aes(x = "", y = tf_idf)) +
+  geom_boxplot(fill = "#0c4c8a") +
+  theme_minimal()
+
+# Re-plot trimmed TF-IDF distribution 
+ggplot(industry_level1, aes(x = tf_idf)) +
+  geom_histogram(bins = 50L, fill = "#0c4c8a") +
+  theme_minimal() + ggtitle("TF-IDF Plot - Industry Level(2)")
+
+
+tfidf_top10_each_industry <- industry_level1 %>%
+  group_by(GICS_Sub_Industry) %>%
+  slice_max(order_by = tf_idf, n = 10) %>% 
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = GICS_Sub_Industry)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~GICS_Sub_Industry, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL)  
+
+ggsave("tfidf_top10_each_industry.jpg", tfidf_top10_each_industry, width = 15, height = 15)
+
+most_frequent_top10_each_industry <- industry_level1 %>%
+  group_by(GICS_Sub_Industry) %>%
+  slice_max(order_by = n_gics, n = 10) %>% 
+  ungroup() %>%
+  ggplot(aes(n_gics, reorder(word, n_gics), fill = GICS_Sub_Industry)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~GICS_Sub_Industry, ncol = 2, scales = "free") +
+  labs(x = "n_gics", y = NULL)  
+
+ggsave("most_frequent_top10_each_industry.jpg", most_frequent_top10_each_industry, width = 15, height = 15)
+
+
+## 2. Market Level (Year)
+
+# Calculate TF-IDF for market aggregation category
+year_level <- tokens_all_10K %>%
+  group_by(year, word) %>%
+  summarise(n_year = sum(n)) %>%
+  bind_tf_idf(word, year, n_year)
+
+# Plot TF-IDF distribution in histogram
+ggplot(year_level, aes(x = tf_idf)) +
+  geom_histogram(bins = 50L, fill = "#0c4c8a") +
+  theme_minimal() + ggtitle("TF-IDF Plot - Industry Level (1)")
+
+# Use boxplot to detect outliers.
+ggplot(year_level, aes(x = "", y = tf_idf)) +
+  geom_boxplot(fill = "#0c4c8a") +
+  theme_minimal()
+
+# According to Zif's law, we only keep the middle part which gives the most information. Here we use 3-sd rule as cut-off value to remove outliers.
+avg_year_tf_idf <- mean(year_level$tf_idf)
+sd_year_tf_idf <- sd(year_level$tf_idf)
+
+# Filter important words using left and right trim
+year_level1 <- year_level %>% 
+  filter(between(tf_idf,
+                 max(0, avg_year_tf_idf - 3*sd_year_tf_idf),
+                 avg_year_tf_idf + 3*sd_year_tf_idf)) %>%
+  arrange(desc(tf_idf))
+
+
+# Re-plot trimmed TF-IDF distribution and boxplot
+ggplot(year_level1, aes(x = tf_idf)) +
+  geom_histogram(bins = 50L, fill = "#0c4c8a") +
+  theme_minimal() + ggtitle("TF-IDF Plot - Industry Level (1)")
+
+ggplot(year_level1, aes(x = "", y = tf_idf)) +
+  geom_boxplot(fill = "#0c4c8a") +
+  theme_minimal()
+
+year_level1 <- year_level1  %>% 
+  filter( year_level1$word !=  "eggplant")
+
+tfidf_top10_each_year <- year_level1 %>%
+  group_by(year) %>%
+  slice_max(order_by = tf_idf, n = 10) %>% 
+  ungroup() %>%
+  ggplot(aes(tf_idf, reorder(word, tf_idf), fill = year)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~year, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL)  
+
+ggsave("tfidf_top10_each_year.jpg", tfidf_top10_each_year, width = 15, height = 15)
+
+most_frequent_top10_each_year <- year_level1 %>%
+  group_by(year) %>%
+  slice_max(order_by = n_year, n = 10) %>% 
+  ungroup() %>%
+  ggplot(aes(n_year, reorder(word, n_year), fill = year)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~year, ncol = 2, scales = "free") +
+  labs(x = "n_gics", y = NULL)  
+
+ggsave("most_frequent_top10_each_year.jpg", most_frequent_top10_each_year, width = 15, height = 15)
+```
+
+
+
+# Part B: Calculating Sentiment Scoring
+
+## Sentiment calculation
+
+```{r sentimenth}
+# Create an identifier code to ease the analysis (CIK_Year)
+
+
+master_index_b$CIK_Year <- as.integer64(master_index_b$CIK_Year)
+
+
+all_indexes_available <- all_indexes %>%
+  inner_join(md_df_without_text) %>%
+  select(-c(form_type,edgar_link))
+  
+all_indexes_available$cik_year <- paste(all_indexes_available$cik, all_indexes_available$year, sep = "_")
+
+annotated_tokens_all$cik_year <- paste(annotated_tokens_all$cik, annotated_tokens_all$year, sep = "_")
+
+
+master_index_b <- na.omit(master_index_b)
+
+
+### Bing Liu Dictionary
+# Calculate sentiment using Bing Liu Dictionary
+bing_liu_sentiment <- annotated_tokens_all %>% 
+  inner_join(get_sentiments("bing")) %>%
+  count(sentiment, cik_year) %>%
+  spread(sentiment, n) %>%
+  mutate(bing_liu_sentiment = log(positive/negative)) %>%
+  select(cik_year, bing_liu_sentiment)
+
+### NRC Dictionary
+# Calculate sentiment using NRC Dictionary
+nrc_sentiment <- annotated_tokens_all %>%
+  inner_join(get_sentiments("nrc")) %>%
+  count(sentiment, cik_year) %>%
+  spread(sentiment, n) %>%
+  mutate(nrc_sentiment = log(positive/negative)) %>%
+  select(cik_year, nrc_sentiment)
+
+### Loughran Dictionary
+# Calculate sentiment using Loughran Dictionary
+loughran_sentiment <- annotated_tokens_all %>%
+  inner_join(get_sentiments("loughran")) %>%
+  count(sentiment, cik_year) %>% 
+  spread(sentiment, n)
+
+#  Calculating the sentiment of the LM dictionary using the word counting
+# sentiment_lm=(Positive-Negative)/(Positive+Negative)
+loughran_sentiment$sentiment_lm = (loughran_sentiment$positive - 
+                                       loughran_sentiment$negative)/
+                                    (loughran_sentiment$positive + 
+                                       loughran_sentiment$negative)
+
+loughran_sentiment <- loughran_sentiment %>% 
+  select(cik_year, sentiment_lm)
+
+lm_sentiment <- annotated_tokens_all %>%
+  inner_join(get_sentiments("loughran")) 
+
+lm_sentiment %>%
+  filter(sentiment %in% c("positive", "negative")) %>% 
+  count(sentiment, word, wt = n) %>% 
+  filter(n >= 5000) %>%
+  mutate(n = ifelse(sentiment == "negative", -n, n)) %>%
+  mutate(term = reorder(word, n)) %>%
+  ggplot(aes(term, n, fill = sentiment)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ylab("Contribution to sentiment")
+
+### Wordnet Affect
+library(corpus)
+affect_wordnet <- affect_wordnet
+affect_wordnet$word <- affect_wordnet$term
+
+# Calculate sentiment using Wordnet Affect Dictionary
+affect_wordnet_sentiment <- annotated_tokens_all %>%
+  inner_join(affect_wordnet) %>% 
+  count(emotion, cik_year) %>% 
+  spread(emotion, n) %>%
+  mutate(wordnet_sentiment = log(Positive/Negative)) %>%
+  select(cik_year, wordnet_sentiment)
+
+
+# Bind all sentiment calculation to the big data frame
+all_indexes_sentiment <- all_indexes_available %>%
+  left_join(bing_liu_sentiment) %>%
+  left_join(loughran_sentiment) %>%
+  left_join(nrc_sentiment) %>%
+  left_join(affect_wordnet_sentiment)
+
+# Lets use lm sentiment score, plot it in time series and check the changes in sentiment each year in different industry
+sentiment_per_industry_by_date <- all_indexes_sentiment %>% inner_join(company_list) %>% 
+  group_by(GICS_Sub_Industry) %>% 
+  select(GICS_Sub_Industry, date_filed, sentiment_lm) %>%
+  ggplot(aes(x=date_filed,y=sentiment_lm))+
+  geom_line(color="red")+geom_point() +
+  facet_wrap(~GICS_Sub_Industry, scales = "free") +
+  labs(x = "date", y = "sentiment")  
+ggsave("sentiment_per_industry_by_date.jpg", sentiment_per_industry_by_date, width = 20, height = 20)
+```
+
+## Extract readability, formality, diversity score.
+-   We can also compare the QDAP with the LM sentiment.
+
+```{r qdapolarity}
+## Using the Qdap Polarity
+
+qdap_df <- md_df %>% 
+  inner_join(company_list) %>% 
+  mutate(total.word = NA,
+         polarity = NA,
+         formality = NA,
+         diversity = NA,
+         readability = NA)
+
+for(i in 1:length(qdap_df$cik)){
+  this_text <- qdap_df$text[i]
+  polarity_i <- qdap::polarity(this_text)
+  qdap_df$polarity[i] <- polarity_i$all$polarity
+  qdap_df$total.word[i] <- polarity_i$all$wc
+  formality_i = qdap::formality(this_text)
+  qdap_df$formality[i] <- formality_i$formality$formality
+  diversity_i <- qdap::diversity(this_text)
+  qdap_df$diversity[i] <- diversity_i$shannon
+  readability_i <- flesch_kincaid(this_text)
+  qdap_df$readability[i] <- readability_i$Readability$FK_grd.lvl
+  print(i)
+}
+write.csv(qdap_df, file="qdap_df.csv",row.names=F,col.names=T)
+
+qdap_df <- qdap_df %>% rename(total_word = total.word)
+
+#Lets plot them and compare how do they look
+#QDAP sentiment vs LM sentiment
+all_sentiment %>%
+  mutate(index = row_number()) %>%
+  ggplot(aes(x=index, y=SentimentQDAP))+geom_line(colour="blue")+
+  geom_line(aes(y=SentimentLM,colour="red"))+geom_point()
+```
+
+## Calculating stock returns
+
+```{r}
+# Downloading stock prices from BatchGetSymbols
+
+# Create big data frame to ease the sentiment analysis process
+company_indexes <- all_indexes_available %>% 
+  inner_join(company_list, by = "cik") %>%
+  mutate(price_adj_ratio = NA)
+
+for (d in 1:length(company_indexes$Symbol)){
+  tryCatch({
+    sp_tickers <- company_indexes$Symbol[d]
+    first.date <- company_indexes$date_before[d]
+    last.date <- company_indexes$date_after[d]
+    cik_year <- company_indexes$cik_year[d]
+    
+    # Download financial data of S&P 500 
+    # Extract prices 7 days before & after filing date
+    returns_daily <- BatchGetSymbols::BatchGetSymbols(sp_tickers,
+                                       first.date = first.date,
+                                       last.date = last.date,
+                                       type.return = "arit")
+    stock_data_filter <- returns_daily$df.tickers %>%
+      filter(ref.date == max(ref.date) | row_number() == 2) %>%
+      arrange(desc(ref.date))
+    # Use log to caculate the price difference.
+    price_adj_ratio <- log(stock_data_filter$price.adjusted[1]) -  log(stock_data_filter$price.adjusted[2]) 
+    # Store the output in a column 
+    company_indexes$price_adj_ratio[d] <- print(price_adj_ratio)
+    
+  }
+  , error = function(ec){
+    error_file <- paste0(sp_tickers, "-", cik_year)
+    
+  }
+  )
+}
+write.csv(company_indexes, file="company_indexes.csv",row.names=F,col.names=T)
+```
+
+## Keyword Analysis
+```{r}
+# We also want to identify context specific keywords to help us predict the stock price changes. Gladly, we have done Udpipe PoS tagging. We will work on top of annotated tokens.
+keyword_predictors <- data.frame()
+annotated_tokens_no_order <- annotated_tokens_all %>% 
+  unique()
+# Option 1: Extracting only nouns. An easy way in order to find keywords is by looking at nouns using Parts of Speech tag.
+keyword_noun <- subset(annotated_tokens_no_order, upos %in% "NOUN") %>% ungroup()
+
+# Here our word column has been cleaned and lemmatised.
+stats <- txt_freq(x = keyword_noun$word)
+
+# Calculate the word frequency acorss all documents.
+library(lattice)
+stats$key <- factor(stats$key, levels = rev(stats$key))
+
+# Visualise the most occurring nouns.
+barchart(key ~ freq, data = head(stats, 30), col = "cadetblue", main = "Most occurring nouns", xlab = "Freq")
+
+# let's take top 10 most occurring nouns as predictors for our linear regression model.
+keyword_predictors <- stats %>%
+  select(-freq_pct) %>% 
+  rename(keyword = key) %>% 
+  arrange(desc(freq)) %>%
+  top_n(10) %>%
+  mutate(ngram = rep(1, 10)) %>%
+  rbind(keyword_predictors) 
+
+# Option 2: Collocation & co-occurrences
+# Although nouns are a great start, we are also interested in multi-word expressions. We can get multi-word expression by looking at word co-occurrences of words which are close in the neighbourhood of one another. 
+
+## Co-occurrences: How frequent do words follow one another
+stats1 <- cooccurrence(x = annotated_tokens_all$word, 
+                     relevant = annotated_tokens_all$upos %in% c("NOUN", "ADJ"))
+wordnetwork1 <- head(stats1, 50)
+wordnetwork1 <- graph_from_data_frame(wordnetwork1)
+ggraph(wordnetwork1, layout = "fr") +
+  geom_edge_link(aes(width = cooc, edge_alpha = cooc), edge_colour = "pink") +
+  geom_node_text(aes(label = name), col = "darkgreen", size = 4) +
+  theme_graph(base_family = "Arial Narrow") +
+  theme(legend.position = "none") +
+  labs(title = "Cooccurrences within 1 word distance", subtitle = "Nouns & Adjective")
+
+## Co-occurrences: How frequent do words follow one another even if we would skip 2 words in between
+stats_2 <- cooccurrence(x = annotated_tokens_all$word, 
+                     relevant = annotated_tokens_all$upos %in% c("NOUN", "ADJ"), skipgram = 2)
+
+# Visualisation of these co-occurrences can be done using a network plot as follows for the top 30 most frequent co-occurring nouns and adjectives.
+library(igraph)
+library(ggraph)
+wordnetwork <- head(stats_2, 50)
+wordnetwork <- graph_from_data_frame(wordnetwork)
+ggraph(wordnetwork, layout = "fr") +
+  geom_edge_link(aes(width = cooc, edge_alpha = cooc), edge_colour = "pink") +
+  geom_node_text(aes(label = name), col = "darkgreen", size = 4) +
+  theme_graph(base_family = "Arial Narrow") +
+  theme(legend.position = "none") +
+  labs(title = "Cooccurrences within 3 words distance", subtitle = "Nouns & Adjective")
+
+
+# Option 3: Textrank (word network ordered by Google Pagerank)
+# Another approach for keyword detection is Textrank, an algorithm implemented in the textrank R package. The algorithm allows to summarise text and as well allows to extract keywords. This is done by constructing a word network by looking if words are following one another. On top of that network the 'Google Pagerank' algorithm is applied to extract relevant words after which relevant words which are following one another are combined to get keywords. We are interested in finding keywords using that algorithm of either nouns or adjectives following one another. You can see from the plot below that the keywords combines words together into multi-word expressions.
+library(textrank)
+stats4 <- textrank_keywords(annotated_tokens_all$word, 
+                          relevant = annotated_tokens_all$upos %in% c("NOUN", "ADJ"), 
+                          ngram_max = 4, sep = " ")
+
+stats4_1<- stats4$keywords
+
+stats4_2 <- stats4_1 %>% subset(stats4_1$ngram > 1 & stats4_1$freq >= 300)
+
+library(wordcloud)
+wordcloud(words = stats4_2$keyword, freq = stats4_2$freq)
+# Let's check top 10 n-gram keywords
+top10_ngrams <- stats4_2 %>% arrange(desc(freq)) %>% top_n(10)
+```
+
+## Build multiple linear regression model
+```{r linear_model}
+# Target variable is the stock price change we calculated in the precious session.
+
+price_df <- company_indexes %>% select(cik_year, price_adj_ratio)
+keywords <- annotated_tokens_no_order %>% 
+  filter(word %in% keyword_predictors$keyword) %>% 
+  select(-c("upos","cik","year")) %>% 
+  group_by(cik_year, word) %>% 
+  summarise(total = sum(n)) %>% 
+  spread(key = word, value = total)
+  
+
+# Let's create a dataframe for linear regression model where we don't need the original text content anymore.
+lm_df <- qdap_df %>% 
+  select(-text) %>% 
+  left_join(all_indexes_sentiment) %>% 
+  select(-c("GICS_Sector", "company_name","Symbol", "date_filed","date_before","date_after","quarter","GICS_Sub_Industry","cik","year","Security")) %>% 
+  relocate(cik_year) 
+# Check NA number in each column 
+colSums(is.na(lm_df))
+# we notice in wordnet sentiment score column, there are 118 NA which means that it's better for us to get rid of this col considering it accounts a big proportion out of 473 observations.
+lm_df$wordnet_sentiment <- NULL
+
+# Drop 3 NAs in sentiment_lm and join keywords variables.
+lm_df <- lm_df %>% 
+  left_join(price_df) %>% 
+  na.omit() %>% 
+  left_join(keywords) 
+
+# Replace NA in keywords columns with 0.
+colSums(is.na(lm_df))
+lm_df[is.na(lm_df)] <- 0
+lm_df$cik_year <- NULL
+# Check the distribution of our target variable.
+hist(lm_df$price_adj_ratio)
+
+# Build up a multiple linear regression model using all the variables against rating. Due to the skewness of the target variable, use log() to resolve.
+res.price.baseline <- lm(price_adj_ratio ~., data = lm_df)
+step.price.baseline <- stepAIC(res.price.baseline, direction = "backward", trace = FALSE)
+
+step.price.baseline <- MASS::stepAIC(res.price.baseline, direction = "backward", trace = FALSE)
+
+summary(step.price.baseline)
+summary(res.price.baseline)
+```
+
+
+# Part C: Topic modeling
+
+## Creat Document-Term Matrices.
+
+```{r castdtm}
+# We are treating all the text inside one GICS industry as one document.
+library(tm)
+library(topicmodels)
+# Creat the corpus and Document-Term Matrices.
+annotated_tokens_all$cik <- as.integer(annotated_tokens_all$cik)
+dtm_df <- annotated_tokens_all %>% 
+  left_join(company_list) %>%
+  select("cik_year", "word", "GICS_Sub_Industry", "cik","year") %>% 
+  group_by(GICS_Sub_Industry, year,word) %>% 
+  summarise(n = n()) 
+dtm_df$GICS_year <- paste(dtm_df$GICS_Sub_Industry, dtm_df$year, sep = "_")
+dtm_df$GICS_year <- gsub(" ","_", dtm_df$GICS_year)
+dtm <- dtm_df %>% 
+  cast_dtm(GICS_year, word, n)
+
+print(paste0("Our Document-Term Matrices contains ", dtm$nrow," rows, ",dtm$ncol," columns, meaning that we have ", dtm$nrow," Sub-industries&Year combinations/documents and vocabulary capacity acorss the whole corpus is ", dtm$ncol ))
+```
+
+
+## Unsupervised Method: Finding the optimal number of topics (Kappa)
+
+```{r optimal_k, cache=TRUE}
+# Change DocumentTermMatrix to Matrix::dgCMatrix for further K selection.
+as.sparseMatrix <- function(simple_triplet_matrix_sparse) {
+
+  sparseMatrix(
+    i = simple_triplet_matrix_sparse$i,
+    j = simple_triplet_matrix_sparse$j,
+    x = simple_triplet_matrix_sparse$v,
+    dims = c(
+      simple_triplet_matrix_sparse$nrow, 
+      simple_triplet_matrix_sparse$ncol
+      ),
+    dimnames = dimnames(simple_triplet_matrix_sparse)
+  )
+
+}
+
+dtm_copy <- as.sparseMatrix(dtm)
+
+#explore the basic frequency
+tf <- TermDocFreq(dtm = dtm_copy)
+original_tf <- tf %>% select(term, term_freq,doc_freq)
+rownames(original_tf) <- 1:nrow(original_tf)
+
+# Reduce sparcity: Eliminate words appearing less than 2 times or in more than half of the
+# documents
+vocabulary <- tf$term[ tf$term_freq > 1 & tf$doc_freq < nrow(dtm) / 2 ]
+
+k_list <- seq(1, 50, by = 1)
+
+# Coherence gives the probabilistic coherence of each topic. Coherence score is a score that calculates if the words in the same topic make sense when they are put together. This gives us the quality of the topics being produced. The higher the score for the specific number of k, it means for each topic, there will be more related words together and the topic will make more sense. 
+model_dir <- "topic_models/"
+if (!dir.exists(model_dir)) dir.create(model_dir)
+
+model_list <- lapply(X = k_list, FUN = function(i){
+  filename = file.path(model_dir, paste0(i, "_topics.rda"))
+  if (!file.exists(filename)) {
+  time <- Sys.time()
+  this_model <- FitLdaModel(dtm = dtm_copy, k = i, iterations = 100)
+  this_model$k <- i
+  this_model$coherence <- CalcProbCoherence(phi = this_model$phi, dtm = dtm_copy, M = 5)
+  save(this_model, file = filename)
+}
+  else{
+    load(filename)
+  }
+  this_model
+} )
+
+save(model_list, file = "model_list.Rda")
+
+# model tuning
+
+# choosing the best model
+coherence_mat <- data.frame(k = sapply(model_list, function(x) nrow(x$phi)), 
+                            coherence = sapply(model_list, function(x) mean(x$coherence)), 
+                            stringsAsFactors = FALSE)
+
+rp<-ggplot(coherence_mat, aes(x = k, y = coherence)) +
+  geom_point() +
+  geom_line(group = 1)+
+  ggtitle("Best Topic by Coherence Score") + theme_minimal() +
+  scale_x_continuous(breaks = seq(1,50,1)) + ylab("Coherence")
+ggsave("rp.jpg", rp, width = 10, height = 10)
+```
+
+
+## Supervised Approach: Build up topic model Using Optimal K.
+
+```
+
+
+## Topic Solution
+```{r}
+#select models based on max average coherence score.
+model <- model_list[which.max(coherence_mat$coherence)][[ 1 ]]
+
+#1. Top 20 terms based on phi  ---------------------------------------------
+model$top_terms <- GetTopTerms(phi = model$phi, M = 20)
+top20_wide <- as.data.frame(model$top_terms)
+model$top_terms <- GetTopTerms(phi = model$phi, M = 20)
+top20_wide <- as.data.frame(model$top_terms)
+
+# 2. Topic,word,freq ------------------------------------------------------
+set.seed(1234)
+final_summary_words <- data.frame(top_terms = t(model$top_terms))
+final_summary_words$topic <- rownames(final_summary_words)
+rownames(final_summary_words) <- 1:nrow(final_summary_words)
+
+library(reshape2)
+final_summary_words <- final_summary_words %>% melt(id.vars = c("topic"))
+final_summary_words <- final_summary_words %>% rename(word = value) %>% select(-variable)
+final_summary_words <- left_join(final_summary_words,annotated_tokens_no_order)
+final_summary_words <- final_summary_words %>% group_by(topic,word) %>%
+  arrange(desc(n))
+final_summary_words <- final_summary_words %>% group_by(topic, word) %>% filter(row_number() == 1) %>% 
+  ungroup() %>% tidyr::separate(topic, into =c("t","topic")) %>% select(-t)
+
+word_topic_freq <- left_join(final_summary_words, original_tf, by = c("word" = "term"))
+
+
+#3. word, topic relationship ---------------------------------------------
+#looking at the terms allocated to the topic and their pr(word|topic)
+allterms <-data.frame(t(model$phi))
+allterms$word <- rownames(allterms)
+rownames(allterms) <- 1:nrow(allterms)
+allterms <- melt(allterms,idvars = "word") 
+allterms <- allterms %>% rename(topic = variable)
+FINAL_allterms <- allterms %>% group_by(topic) %>% arrange(desc(value))
+
+#4. per-document-per-topic probabilities ----------------------------------------------
+#trying to see the topic in each document, where we are going to use this as predictors for market stock price change.
+theta_df <- data.frame(model$theta)
+theta_df$document <-rownames(theta_df) 
+rownames(theta_df) <- 1:nrow(theta_df)
+
+theta_df_lm <- theta_df
+theta_df <- reshape2::melt(theta_df,id.vars = "document")
+theta_df <- theta_df %>% rename(topic = variable) 
+theta_df <- theta_df %>% 
+  tidyr::separate(topic, into =c("t","topic")) %>%
+  select(-t)
+FINAL_document_topic <- theta_df %>%
+  group_by(document) %>% 
+  arrange(desc(value)) %>%
+  filter(row_number() ==1)
+
+```
+
+
+## Topic Vistualisation
+```{r}
+
+#5. Visualising of topics in a dendrogram ----------------------------------------------
+#probability distributions called Hellinger distance, distance between 2 probability vectors
+model$topic_linguistic_dist <- CalcHellingerDist(model$phi)
+model$hclust <- hclust(as.dist(model$topic_linguistic_dist), "ward.D")
+model$hclust$labels <- paste(model$hclust$labels, model$labels[ , 1])
+den <- plot(model$hclust)
+
+ggsave("den.jpg",den ,width  = 10, height  = 10)
+
+
+#6. Visualising topics of words using wordcloud based on the max value of phi ----------------------------------------------
+library(wordcloud)
+for(i in 1:length(unique(final_summary_words$topic))){
+  wordcloud(words = subset(final_summary_words ,topic == i)$word, 
+            freq = subset(final_summary_words ,topic == i)$n,
+            min.freq = 1,
+            max.words=200,
+            random.order=FALSE,
+            rot.per=0.35, 
+            colors=brewer.pal(8, "Dark2"))}
+
+
+library(ggplot2)
+
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered()
+```
+
+## Evaluate Additive Predicbility Effect of Topics on Stock Price
+```{r}
+company_indexes$GICS_Sub_Industry_1 <- gsub(" ","_",company_indexes$GICS_Sub_Industry)
+company_indexes$document <- paste(company_indexes$GICS_Sub_Industry_1, company_indexes$year, sep = "_")
+
+theta_df_lm <- theta_df_lm %>% 
+  ungroup() %>% 
+  left_join(company_indexes) %>% 
+  select(-c("document","company_name","Security","Symbol","date_before","date_after","cik","quarter","year","GICS_Sector","GICS_Sub_Industry","date_filed"))
+
+lm_df_new <- lm_df %>% 
+  left_join(theta_df_lm) %>% 
+  na.omit() %>% 
+  select(-c("GICS_Sub_Industry_1","cik_year"))
+  
+topic_lm <- lm_df_new %>% 
+  select(t_1:t_47, price_adj_ratio) 
+
+# predictbility of only topics
+
+topic_regression <- lm(price_adj_ratio ~., data = topic_lm)
+
+topic_regression_summary <- head(as.data.frame(summary(topic_regression)$coefficients) %>% 
+  tibble::rownames_to_column() %>% 
+  rename(t_value = 't value') %>% 
+  mutate(absolute_t_value = abs(t_value)) %>% 
+  arrange(desc(absolute_t_value)),10) %>% 
+  mutate(significance = case_when(
+    `Pr(>|t|)` <= 0.05 ~ "significant*",
+    `Pr(>|t|)` > 0.05 ~ "not significant"
+  )) %>% 
+  mutate(r_square = paste("Multiple R-squared:", as.character(round(summary(topic_regression)$r.squared,3))))
+
+ggplot(topic_regression_summary, aes(x = reorder(rowname, absolute_t_value), y = absolute_t_value, fill = significance))+
+  geom_bar(stat = "identity")+
+  labs(title = "Top 10 Topic Features for predicting Stock Price Change after 10-K Fillings", y = "Absolute t_value", x = "Features")+coord_flip()
+
+
+# Let's check the significant topics' singular effect.
+topic_46_lm <- lm(price_adj_ratio~t_46, data = topic_lm)
+topic_5_lm <- lm(price_adj_ratio~t_5, data = topic_lm)
+stargazer::stargazer(topic_46_lm,topic_5_lm,type = "text")
+
+# analysis: Topic 46 and topic 5 are able to account for the stock change at negative 0.1% and 0.04% respectively.
+
+#  Visualising topics of words using wordcloud in both topic 46 and 5 ----------------------------------------------
+library(wordcloud)
+wordcloud(words = subset(final_summary_words ,topic == 46)$word, 
+            freq = subset(final_summary_words ,topic == 46)$n,
+            min.freq = 10,
+            max.words=100,
+            random.order=F,
+            rot.per=0.35, 
+            colors=brewer.pal(8, "Dark2"))
+wordcloud(words = subset(final_summary_words ,topic == 5)$word, 
+            freq = subset(final_summary_words ,topic == 5)$n,
+            min.freq = 10,
+            max.words=100,
+            random.order=F,
+            rot.per=0.35, 
+            colors=brewer.pal(8, "Dark2"))
+
+# build regression model both from part B and topics.
+lm_df_new <- lm_df_new %>% 
+  na.omit(.)
+
+regression_sentiment_topic <- lm(price_adj_ratio~., data = lm_df_new)
+
+
+
+step.topic.baseline <- MASS::stepAIC(regression_sentiment_topic, direction = "backward", trace = FALSE)
+summary(step.topic.baseline)
+regression_sentiment_topic_summary <- head(as.data.frame(summary(step.topic.baseline)$coefficients) %>% 
+  tibble::rownames_to_column() %>% 
+  rename(t_value = 't value') %>% 
+  mutate(absolute_t_value = abs(t_value)) %>% 
+  arrange(desc(absolute_t_value)),10) %>% 
+  mutate(significance = case_when(
+    `Pr(>|t|)` <= 0.05 ~ "significant*",
+    `Pr(>|t|)` > 0.05 ~ "not significant"
+  )) %>% 
+  mutate(r_square = paste("Multiple R-squared:", as.character(round(summary(topic_regression)$r.squared,3))))
+
+ggplot(regression_sentiment_topic_summary, aes(x = reorder(rowname, absolute_t_value), y = absolute_t_value, fill = significance))+
+  geom_bar(stat = "identity")+
+  labs(title = "Top 10 Topic Features for predicting Stock Price Change after 10-K Fillings", y = "Absolute t_value", x = "Features")+coord_flip()
+
+
+```
+
